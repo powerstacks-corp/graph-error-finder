@@ -1,0 +1,21 @@
+# Diagnostic output (the script writes timestamped logs here by default)
+*.log
+GraphDiag_*.log
+
+# PowerShell ISE / VS Code transient files
+*.ps1xml.bak
+*.ps1.bak
+
+# OS noise
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Editor / tooling
+.vscode/
+.idea/
+
+# Local secrets — never commit
+*.secret
+*.creds
+.env
