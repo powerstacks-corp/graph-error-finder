@@ -10,20 +10,30 @@ This script is published by **PowerStacks** for use by **BI for Intune** custome
 
 ## What the script does
 
-The script authenticates to the Microsoft Graph API as a service principal and runs a controlled diagnostic against three endpoints that historically exhibit scale issues:
+The script authenticates to the Microsoft Graph API as a service principal and runs a controlled diagnostic against endpoints that historically exhibit scale issues or silent partial-page bugs:
 
 | Endpoint | What it queries |
 |----------|-----------------|
 | `deviceAppManagement/mobileApps` | All mobile apps with `assignments` and `categories` expanded |
 | `deviceManagement/deviceManagementScripts` | All platform scripts with `assignments` expanded |
 | `deviceManagement/deviceHealthScripts` | All proactive remediations (with auto page-size discovery) |
+| `deviceManagement/deviceCompliancePolicySettingStateSummaries/{id}/deviceComplianceSettingStates` | Per-device compliance setting states (v2.0) — exercises the endpoint Microsoft has acknowledged returns small result sets without erroring |
 
-For each endpoint it captures:
+For each endpoint the script captures two distinct categories of issue:
 
-- HTTP status codes per attempt (success, 429, 500, 503, 504, gateway timeouts)
+**Errors** (HTTP-level failures):
+
+- HTTP status codes per attempt (429, 500, 503, 504, gateway timeouts)
 - Response time per attempt and per page (in milliseconds)
 - `Retry-After` headers (when present) and the exponential backoff applied when not
 - Number of retries needed before a successful page
+
+**Problems** (HTTP 200 OK but the response is suspicious — new in v2.0):
+
+- **Small result set anomaly:** the response has fewer rows than `$top` requested AND `@odata.nextLink` is present (Graph claims more data exists while returning a partial page). Per Julien on the BI for Intune team (2026-05-20), Microsoft has confirmed this behavior on the `deviceComplianceSettingStates` endpoint and classified it as "by design," though it silently breaks downstream consumers that assume `count < $top` means end-of-data. The detector also runs against every other paged Graph call in the script, so future endpoints exhibiting the same pattern will be caught automatically.
+
+For each endpoint the script also captures:
+
 - Pagination behavior (`@odata.nextLink` chain length)
 - Total items returned per endpoint and per `@odata.type` breakdown
 
@@ -31,7 +41,7 @@ For `deviceHealthScripts`, the script auto-discovers the largest page size that 
 
 Optionally (set `$doScaleTest = $true`), the script also iterates every item per endpoint and queries `/assignments` individually, capturing per-item response times, assignment counts, "All Devices" / "All Users" scope flags, and the slowest items. This data helps Microsoft identify whether a single noisy item is causing backend pressure.
 
-All output is written to console **and** to a single timestamped log file under `C:\Temp` (configurable). The log includes a CSV-formatted retry-event table at the bottom so it can be opened directly in Excel.
+All output is written to console **and** to a single timestamped log file under `C:\Temp` (configurable). The log includes a CSV-formatted retry-event table AND a CSV-formatted Problems table at the bottom so both can be opened directly in Excel.
 
 ---
 
@@ -64,14 +74,20 @@ You need an app registration with **client-credentials** authentication and the 
 Open `Graph API Error Finder.ps1` and set the values at the top of the **Configuration** region:
 
 ```powershell
-$TenantId     = "<your-tenant-guid>"
-$ClientId     = "<your-app-registration-client-id>"
-$ClientSecret = "<your-client-secret>"
-$PageSize     = 100      # Default page size for each endpoint
-$MaxRetries   = 7        # Per-page retry ceiling
-$LogDir       = "C:\Temp"
-$doScaleTest  = $False   # Set $True for per-item assignment diagnostic (slower)
+$TenantId         = "<your-tenant-guid>"
+$ClientId         = "<your-app-registration-client-id>"
+$ClientSecret     = "<your-client-secret>"
+$PageSize         = 100      # Default page size for each endpoint
+$MaxRetries       = 7        # Per-page retry ceiling
+$LogDir           = "C:\Temp"
+$doScaleTest      = $False   # Set $True for per-item assignment diagnostic (slower)
+$doComplianceTest = $True    # v2.0 — exercise deviceComplianceSettingStates for small-result-set detection
 ```
+
+> The compliance test (`$doComplianceTest = $True`) iterates every
+> compliance setting summary in the tenant and fetches per-device states
+> for each. Plan for 5–15 extra minutes depending on tenant size. Set
+> to `$False` if you only want the HTTP-error focused tests.
 
 ### Handling the client secret
 
@@ -133,6 +149,7 @@ After the run finishes, the entire log is in `C:\Temp\GraphDiag_<timestamp>.log`
 - Every retry event with HTTP status and wait time
 - A type breakdown so Microsoft can see whether the slow endpoint is dominated by a particular app type
 - A CSV-formatted retry table at the bottom that Microsoft can paste directly into Excel
+- A **CSV-formatted Problems table** (v2.0) listing every paged response where the row count was less than `$top` AND `@odata.nextLink` was present — concrete evidence of the silent partial-page behavior. Each row includes the endpoint, page number, exact URL requested, expected row count, actual row count, and the `nextLink` value Graph returned.
 - (If `$doScaleTest = $True`) a CSV listing the slowest items and any "All Devices" / "All Users" assignments
 
 Before sharing, scan the log for any sensitive values you'd like to redact — the script does not log secrets, but it does include your tenant ID and app registration object ID, which is usually fine for a support case.
