@@ -1,173 +1,238 @@
 # Graph API Error Finder
 
-A PowerShell diagnostic script that collects Microsoft Graph API request data — including pagination behavior, throttling responses, retry timings, and per-item assignment scale — so customers can share concrete evidence with Microsoft Support when troubleshooting slow syncs or sync failures with Microsoft Intune.
+A PowerShell diagnostic script that gathers hard evidence about how Microsoft Graph and the Intune reports
+Export API actually behave in your tenant: pagination, throttling, retries, page-size failures, export-job
+latency, and silent data loss. The output is designed to be attached to a Microsoft Support case.
 
-This script is published by **PowerStacks** for use by **BI for Intune** customers (and anyone else integrating with Intune-related Graph endpoints) who need to gather diagnostic data for a Microsoft Support case.
+Published by **PowerStacks** for **BI for Intune** customers, and for anyone integrating with Intune Graph
+endpoints who needs to prove what is going wrong rather than describe it.
 
-> **Use this script when:** your Intune sync into BI for Intune (or any direct Graph API integration) is slow, intermittently failing, or returning HTTP 429 / 500 / 503 / 504, and Microsoft Support has asked for repro details.
+> **Use this when:** your Intune sync is slow, intermittently failing, returning HTTP 429/500/502/503/504,
+> or quietly returning less data than it should, and you need reproducible evidence for Microsoft.
+
+**Current version: 4.5.1.** The script's `.NOTES` block carries the full version history, including the
+field observations behind each change. That is the authoritative changelog; this README describes what the
+script does today.
 
 ---
 
 ## What the script does
 
-The script authenticates to the Microsoft Graph API as a service principal and runs a controlled diagnostic against endpoints that historically exhibit scale issues or silent partial-page bugs:
+It authenticates as a service principal and runs two families of diagnostics.
 
-| Endpoint | What it queries |
-|----------|-----------------|
-| `deviceAppManagement/mobileApps` | All mobile apps with `assignments` and `categories` expanded |
-| `deviceManagement/deviceManagementScripts` | All platform scripts with `assignments` expanded |
-| `deviceManagement/deviceHealthScripts` | All proactive remediations (with auto page-size discovery) |
-| `deviceManagement/deviceCompliancePolicySettingStateSummaries/{id}/deviceComplianceSettingStates` | Per-device compliance setting states (v2.0) — exercises the endpoint Microsoft has acknowledged returns small result sets without erroring |
+### 1. Paged Graph collection endpoints
 
-For each endpoint the script captures two distinct categories of issue:
+Exercises the endpoints BI for Intune reads, at production shape and page size:
 
-**Errors** (HTTP-level failures):
+| Endpoint | What it exercises |
+|---|---|
+| `deviceAppManagement/mobileApps` | `$expand=assignments,categories` at production page size, plus isolation variants (assignments only, categories only, no expand, and the proposed fix shape) to separate payload composition from page size |
+| `deviceManagement/deviceManagementScripts` | Platform scripts with `assignments` expanded |
+| `deviceManagement/deviceHealthScripts` | Proactive remediations with `assignments` expanded |
 
-- HTTP status codes per attempt (429, 500, 503, 504, gateway timeouts)
-- Response time per attempt and per page (in milliseconds)
-- `Retry-After` headers (when present) and the exponential backoff applied when not
-- Number of retries needed before a successful page
+For each page it records HTTP status, per-attempt and per-page timing, `Retry-After` handling, backoff, and
+retry counts. Two behaviors get special handling:
 
-**Problems** (HTTP 200 OK but the response is suspicious — new in v2.0):
+- **Adaptive page size.** On timeout-class failures the script halves `$top` and retries immediately (no
+  backoff, because a smaller request is a different request, not a transient one). After 3 consecutive pages
+  need reduction it rides at the reduced size instead of relearning the same failure on every page. This is
+  configurable, including a pure evidence mode that retries every page at full size to maximize
+  fail/succeed pairs for escalation.
+- **Problems (HTTP 200, but wrong).** A page that returns fewer rows than `$top` **and** carries an
+  `@odata.nextLink` is recorded as a small-result-set anomaly: Graph claims more data exists while handing
+  back a partial page, which silently breaks any consumer that treats `count < $top` as end-of-data. The
+  detector runs against every paged call, so new endpoints exhibiting it are caught automatically.
 
-- **Small result set anomaly:** the response has fewer rows than `$top` requested AND `@odata.nextLink` is present (Graph claims more data exists while returning a partial page). Per Julien on the BI for Intune team (2026-05-20), Microsoft has confirmed this behavior on the `deviceComplianceSettingStates` endpoint and classified it as "by design," though it silently breaks downstream consumers that assume `count < $top` means end-of-data. The detector also runs against every other paged Graph call in the script, so future endpoints exhibiting the same pattern will be caught automatically.
+### 2. Intune reports Export API
 
-For each endpoint the script also captures:
+Exercises `deviceManagement/reports/exportJobs`, the pipeline BI for Intune's compliance reporting uses:
+job creation, queue and processing latency, download, and CSV row validation. It flags stuck jobs, failed
+jobs, and jobs that complete but return the wrong number of rows.
 
-- Pagination behavior (`@odata.nextLink` chain length)
-- Total items returned per endpoint and per `@odata.type` breakdown
+It also reproduces the silent-incomplete-data pattern directly: an **unfiltered baseline export** is
+compared against **per-ID filtered exports** (the production access pattern). Because a live tenant drifts
+while the jobs run, the baseline is **bracketed**: a second unfiltered export runs after the filtered jobs,
+and a mismatch is only reported as deterministic when the filtered count falls outside *both* baselines.
+Drift-consistent mismatches are recorded separately rather than reported as data loss.
 
-For `deviceHealthScripts`, the script auto-discovers the largest page size that succeeds (starting at 100 and halving on failure) — useful for showing Microsoft the threshold at which their endpoint begins returning errors.
+### Remediation run states
 
-Optionally (set `$doScaleTest = $true`), the script also iterates every item per endpoint and queries `/assignments` individually, capturing per-item response times, assignment counts, "All Devices" / "All Users" scope flags, and the slowest items. This data helps Microsoft identify whether a single noisy item is causing backend pressure.
+`deviceRunStates` is the largest dataset in this family (hundreds of scripts across tens of thousands of
+devices), and its export report requires a `PolicyId` filter, so no bulk ground truth exists. The script
+therefore tests three witnesses per sampled script: the filtered export, the paged endpoint, and the
+script's own `runSummary` counters. Export versus paged is the hard comparison, and disagreement is flagged.
 
-All output is written to console **and** to a single timestamped log file under `C:\Temp` (configurable). The log includes a CSV-formatted retry-event table AND a CSV-formatted Problems table at the bottom so both can be opened directly in Excel.
+### Optional scale test
+
+`$doScaleTest = $True` queries `/assignments` for every item individually, capturing per-item response
+times, assignment counts, "All Devices" / "All Users" scope flags, and the slowest items. Useful for showing
+whether one noisy item is causing backend pressure. It is slow, and off by default.
+
+---
+
+## Output
+
+Everything lands in `$LogDir` (default `C:\Temp`), timestamped per run:
+
+| File | Contents |
+|---|---|
+| `GraphDiag_<ts>.log` | The run log, in **CMTrace format**: millisecond timestamps, severity types, and bias, so failures and warnings colour-code in CMTrace. Open it with CMTrace or any text editor. |
+| `RetryEvents_<ts>.csv` | Every retry: endpoint, page, attempt, HTTP status, wait, request id, and the scale unit that served it |
+| `Problems_<ts>.csv` | Every small-result-set anomaly and other 200-but-wrong finding |
+| `ExportDiagnostic_<ts>.csv` | Export job lifecycle and the baseline-vs-filtered reconciliation |
+| `ScaleDiagnostic_<ts>.csv` | Per-item assignment data (only when `$doScaleTest` is on) |
+
+The run ends with a **verdict-first summary**: an Overall line (areas failed or warned, problem/retry
+counts), then one `[PASS]` / `[WARN]` / `[FAIL]` line per diagnostic area with the single fact behind it,
+then problem counts by type. The detailed tables follow under a `DETAIL` divider as drill-down.
+
+### Traceability
+
+Every request carries a generated `client-request-id`, and Graph is asked to echo it back, so even failures
+with no response (client timeouts, dropped connections) remain traceable. Every failed response's
+`x-ms-ags-diagnostic` is parsed for the **scale unit** that served that specific request, and recorded in the
+retry CSV. Note this identifies the Graph front-end gateway node, which varies per request by load
+balancing. It is not your tenant's home scale unit (the Intune console's "Tenant location"), which is worth
+recording separately when comparing across tenants.
 
 ---
 
 ## Prerequisites
 
-### PowerShell
-- Windows PowerShell 5.1 or PowerShell 7+ (script uses `Invoke-RestMethod` and standard cmdlets only — no external modules required)
-
-### Microsoft Entra ID (Azure AD) app registration
-You need an app registration with **client-credentials** authentication and the right Graph permissions.
-
-1. Create or reuse an app registration in **Microsoft Entra admin center → Identity → Applications → App registrations → New registration**.
-2. Generate a client secret under **Certificates & secrets → Client secrets**.
-3. Under **API permissions**, add the following **application** (not delegated) permissions and grant admin consent:
+- **PowerShell 5.1 or 7+.** No external modules: `Invoke-RestMethod` and standard cmdlets only.
+- **An Entra ID app registration** using client-credentials auth, with these **application** permissions
+  granted admin consent:
 
 | Permission | Why |
-|------------|-----|
-| `DeviceManagementApps.Read.All` | Read mobile apps and their assignments |
-| `DeviceManagementConfiguration.Read.All` | Read platform scripts and their assignments |
-| `DeviceManagementManagedDevices.Read.All` | Required for proactive remediations / device health scripts |
+|---|---|
+| `DeviceManagementApps.Read.All` | Mobile apps and their assignments |
+| `DeviceManagementConfiguration.Read.All` | Platform scripts, compliance policies, export reports |
+| `DeviceManagementManagedDevices.Read.All` | Proactive remediations, device run states, device reports |
 
-> If you're already running BI for Intune, the existing app registration likely has these permissions and can be reused. Check with your administrator before creating a new one.
+> If you already run BI for Intune, its existing app registration typically has these and can be reused.
+> Check with your administrator first.
 
-4. Note the **Tenant ID**, **Application (client) ID**, and **client secret value** from the app registration overview and certificates pages.
+---
+
+## Running it
+
+`TenantId` and `ClientId` have in-file defaults and can be overridden per run. The secret is never stored in
+the script:
+
+```powershell
+# Prompted for the secret (hidden input)
+.\"Graph API Error Finder.ps1" -TenantId <tenant-guid> -ClientId <app-id>
+
+# Or from the environment
+$env:GRAPH_DIAG_SECRET = 'paste-secret-here'
+.\"Graph API Error Finder.ps1"
+
+# Or passed explicitly (avoid: it lands in your shell history)
+.\"Graph API Error Finder.ps1" -ClientSecret '<secret>'
+```
+
+Runtime depends heavily on which diagnostics are enabled and on tenant size. The paged passes are minutes.
+The export comparison submits one job per distinct key value and can run considerably longer, which is why
+export jobs are batched (see `$ExportJobConcurrency`).
 
 ---
 
 ## Configuration
 
-Open `Graph API Error Finder.ps1` and set the values at the top of the **Configuration** region:
+Set these in the **Configuration** region near the top of the script.
 
-```powershell
-$TenantId         = "<your-tenant-guid>"
-$ClientId         = "<your-app-registration-client-id>"
-$ClientSecret     = "<your-client-secret>"
-$PageSize         = 100      # Default page size for each endpoint
-$MaxRetries       = 7        # Per-page retry ceiling
-$LogDir           = "C:\Temp"
-$doScaleTest      = $False   # Set $True for per-item assignment diagnostic (slower)
-$doComplianceTest = $True    # v2.0 — exercise deviceComplianceSettingStates for small-result-set detection
-```
+### Core
 
-> The compliance test (`$doComplianceTest = $True`) iterates every
-> compliance setting summary in the tenant and fetches per-device states
-> for each. Plan for 5–15 extra minutes depending on tenant size. Set
-> to `$False` if you only want the HTTP-error focused tests.
+| Setting | Default | Purpose |
+|---|---|---|
+| `$PageSize` | `50` | Default `$top` for paged endpoints |
+| `$MaxRetries` | `3` | Per-page retry ceiling |
+| `$TimeoutSec` | `60` | Per-request timeout |
+| `$LogDir` | `C:\Temp` | Where the log and CSV artifacts are written |
 
-### Handling the client secret
+### Adaptive page size
 
-The script reads the secret as a plain string for simplicity, but **never commit a real secret** to source control or share it. Recommended patterns:
+| Setting | Default | Purpose |
+|---|---|---|
+| `$ReduceTopOnTimeout` | `$true` | Halve `$top` on timeout-class failures |
+| `$MinTop` | `5` | Floor for reduction |
+| `$AdaptiveStickyThreshold` | `3` | Consecutive reduced pages before riding at the reduced size. `0` = pure evidence mode (retry every page at full size) |
+| `$AdaptiveProbeInterval` | `0` | `0` = never retry full size once it is known to fail. Set to e.g. `20` to periodically probe and recover if the service heals mid-run |
 
-- Set the value in your local copy of the script and don't push the change.
-- Or replace the literal with `$ClientSecret = $env:GRAPH_CLIENT_SECRET` and set the environment variable in your shell:
+### Diagnostic toggles
 
-  ```powershell
-  $env:GRAPH_CLIENT_SECRET = 'paste-secret-here'
-  ```
+| Setting | Default | Purpose |
+|---|---|---|
+| `$doVariantTest` | `$True` | Re-collect variant `$expand` shapes to isolate payload composition from page size |
+| `$doExportTest` | `$True` | Exercise the reports Export API |
+| `$doExportComparison` | `$True` | Unfiltered baseline vs per-ID filtered exports |
+| `$doRemediationTest` | `$True` | Remediation run-state three-witness comparison |
+| `$doScaleTest` | `$False` | Per-item assignment diagnostic (slow) |
 
-- Or read from a credential store (`Get-Secret` from `Microsoft.PowerShell.SecretManagement`).
+### Export and comparison
 
-After the support case is closed, **rotate the client secret** in Entra ID. Treat any secret that has been pasted into a script file as compromised.
+| Setting | Default | Purpose |
+|---|---|---|
+| `$ExportJobConcurrency` | `5` | Export jobs in flight at once. Raise cautiously: export job creation is tenant-throttled |
+| `$ExportPollIntervalSec` | `10` | Seconds between job status polls |
+| `$ExportPollTimeoutSec` | `900` | Give up and flag `ExportJobStuck` |
+| `$ComparisonReport` | `DevicePolicySettingsComplianceReportV3` | Report the comparison runs against |
+| `$ComparisonKeyColumn` | `PolicyId` | Column the comparison keys on. Must match production's filter |
+| `$ComparisonMaxSettings` | `0` | `0` = every distinct key value; `N` = top-N by row count (quick runs) |
+| `$ComparisonBracketBaseline` | `$True` | Second baseline after the filtered jobs, so drift is not misreported as data loss |
+| `$ComparisonRetestMismatches` | `$True` | Re-run each mismatched filtered job once |
 
----
+### Remediation
 
-## Running the script
-
-```powershell
-.\"Graph API Error Finder.ps1"
-```
-
-You'll see live progress in the console:
-
-```
-==========================================
-  Graph API Diagnostic Script
-  Run timestamp : 20260504_120300
-  Log file      : C:\Temp\GraphDiag_20260504_120300.log
-==========================================
-
-[12:03:00] Acquiring token...
-  Token acquired successfully
-  Expires      : 13:03:00 (in 3600s)
-  ...
-
-[12:03:01] ===== mobileApps =====
-  Using page size: 100
-  URL: https://graph.microsoft.com/beta/deviceAppManagement/mobileApps?$expand=assignments,categories&$top=100
-
-  [Page 1] GET ...
-    Attempt 1 succeeded in 2840ms (2.8s)
-    Records this page : 100
-    Running total     : 100
-    ...
-```
-
-A typical run takes 1–10 minutes depending on tenant size. The scale test (`$doScaleTest = $True`) can take significantly longer because it hits each item individually.
+| Setting | Default | Purpose |
+|---|---|---|
+| `$RemediationSampleCount` | `5` | Scripts to test, ranked by device count. `0` = all (expect hours) |
+| `$RemediationPagedPageCap` | `400` | Max paged pages per script (~40k rows) |
+| `$RemediationPagedTop` | `100` | `$top` for paged run states. Note the Intune console itself pages this data at 40 |
 
 ---
 
-## What to send to Microsoft Support
+## What to send Microsoft Support
 
-After the run finishes, the entire log is in `C:\Temp\GraphDiag_<timestamp>.log` (or your configured `$LogDir`). That single file is what you attach to the support case — it contains:
+Attach `GraphDiag_<ts>.log` plus the CSV artifacts. They are already in the shape a support engineer wants:
 
-- The end-to-end timing for every page request
-- Every retry event with HTTP status and wait time
-- A type breakdown so Microsoft can see whether the slow endpoint is dominated by a particular app type
-- A CSV-formatted retry table at the bottom that Microsoft can paste directly into Excel
-- A **CSV-formatted Problems table** (v2.0) listing every paged response where the row count was less than `$top` AND `@odata.nextLink` was present — concrete evidence of the silent partial-page behavior. Each row includes the endpoint, page number, exact URL requested, expected row count, actual row count, and the `nextLink` value Graph returned.
-- (If `$doScaleTest = $True`) a CSV listing the slowest items and any "All Devices" / "All Users" assignments
+- The verdict summary states what failed and why, in one line per area.
+- `RetryEvents.csv` gives every failure with status, timing, request id, and serving scale unit.
+- `Problems.csv` is the concrete evidence of 200-but-incomplete responses: endpoint, page, exact URL,
+  expected rows, actual rows, and the `nextLink` Graph returned alongside the short page.
+- `ExportDiagnostic.csv` shows the baseline-vs-filtered reconciliation, including which mismatches are
+  deterministic and which are drift.
 
-Before sharing, scan the log for any sensitive values you'd like to redact — the script does not log secrets, but it does include your tenant ID and app registration object ID, which is usually fine for a support case.
+The log contains your tenant ID and app registration object ID, which is normally fine for a support case.
+It does not log secrets. Scan before sharing if you have local policy about it.
 
 ---
 
-## Security notes
+## Notes on behavior worth knowing
 
-- **Read-only.** The script never writes to or modifies your Intune tenant. It only issues `GET` requests.
-- **Application permissions.** The script uses client-credentials authentication, which means it acts as the application — not as a user. The granted Graph permissions limit what it can read.
-- **Credential hygiene.** Never commit your client secret. Rotate the secret after use. Limit the app registration to read-only Graph permissions and remove the assignment when you're done diagnosing.
-- **Network access.** The script reaches `https://login.microsoftonline.com` and `https://graph.microsoft.com`. No data leaves your machine other than to those Microsoft endpoints.
+- **Read-only.** Only `GET` requests against Graph, plus `POST` to create export jobs (which create a report
+  export, not a tenant change). Nothing in your tenant is modified.
+- **Console QuickEdit is disabled at startup** (Windows only). Selecting text in a console window blocks
+  writes and will freeze a long run. The script turns QuickEdit off for the session, and writes to the log
+  file before the console, so if output ever blocks again the log still advances with true progress. If the
+  file is ahead of the screen, the console is frozen, not the script.
+- **Paged passes run sequentially by design.** Their product is timing and failure-rate measurement, so
+  running them concurrently would contaminate the numbers. Only export jobs are batched.
+
+---
+
+## Security
+
+- Never commit a client secret. Prefer the prompt or `$env:GRAPH_DIAG_SECRET` over `-ClientSecret`.
+- Rotate the secret after the support case closes. Treat any secret pasted into a file as compromised.
+- Keep the app registration read-only, and remove it when you are done diagnosing.
+- Network access is limited to `login.microsoftonline.com` and `graph.microsoft.com`.
 
 ---
 
 ## License
 
-[MIT](LICENSE) — use, modify, and share freely.
+[MIT](LICENSE)
 
 ## Maintainer
 
