@@ -232,7 +232,7 @@ It does not log secrets. Scan before sharing if you have local policy about it.
 
 ## License
 
-[MIT](LICENSE)
+[PolyForm Noncommercial 1.0.0](LICENSE). Copyright (c) 2024-2026 PowerStacks Corporation.
 
 ## Maintainer
 
