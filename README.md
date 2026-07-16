@@ -232,7 +232,11 @@ It does not log secrets. Scan before sharing if you have local policy about it.
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE). Copyright (c) 2024-2026 PowerStacks Corporation.
+[PolyForm Shield 1.0.0](LICENSE). Copyright (c) 2024-2026 PowerStacks Corporation.
+
+Any purpose is permitted, including commercial use inside your own business, with one exception: you may
+not use it to provide a product that competes with PowerStacks. Run it against your tenants, modify it,
+and share it freely.
 
 ## Maintainer
 
